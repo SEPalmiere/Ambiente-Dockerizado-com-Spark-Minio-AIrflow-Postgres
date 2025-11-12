@@ -1,0 +1,567 @@
+# =============================================================================
+# DATA PLATFORM - Airflow + Spark + MinIO + Jupyter + PostgreSQL + PgAdmin + Metabase
+# =============================================================================
+# Versão: 2.0
+# Stack: Airflow 2.8.1 | Spark 3.5.0 | MinIO | Jupyter | PostgreSQL 15 | Metabase
+# =============================================================================
+
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.1-python3.11}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    &airflow-common-env
+    # Airflow Core
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__FERNET_KEY: ''
+    
+    # Database
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    
+    # Celery
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:${REDIS_PORT}/0
+    
+    # API
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    
+    # Webserver (Mantido do original)
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'airflow_secret_key_change_this'
+    AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: 'True'
+    
+    # Scheduler (Mantido do original)
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 5
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 20
+    
+    # SMTP Configuration (Mantido do original)
+    AIRFLOW__SMTP__SMTP_HOST: ${AIRFLOW_SMTP_HOST}
+    AIRFLOW__SMTP__SMTP_USER: ${AIRFLOW_SMTP_USER}
+    AIRFLOW__SMTP__SMTP_PASSWORD: ${AIRFLOW_SMTP_PASSWORD}
+    AIRFLOW__SMTP__SMTP_PORT: ${AIRFLOW_SMTP_PORT}
+    AIRFLOW__SMTP__SMTP_MAIL_FROM: ${AIRFLOW_MAIL_FROM}
+    
+    # Spark Integration
+    SPARK_MASTER_URL: spark://spark-master:${SPARK_MASTER_PORT}
+    SPARK_HOME: /usr/local/spark
+    
+    # MinIO Integration
+    MINIO_ENDPOINT: minio:${MINIO_API_PORT}
+    MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+    MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    
+    # Additional Requirements
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
+    - ${AIRFLOW_PROJ_DIR:-.}/notebooks:/opt/airflow/notebooks
+    - ${AIRFLOW_PROJ_DIR:-.}/spark-apps:/opt/airflow/spark-apps
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+# =============================================================================
+# SERVICES
+# =============================================================================
+services:
+  
+  # ---------------------------------------------------------------------------
+  # POSTGRESQL - Metastore Database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: data-platform-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # MLFLOW - Machine Learning Lifecycle Management
+  # ---------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: data-platform-mlflow
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root s3://mlflow-artifacts/
+      --host 0.0.0.0
+      --port 5000
+    depends_on:
+      - minio
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # PROMETHEUS - Metrics Collection
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: data-platform-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # GRAFANA - Monitoring & Visualization
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: data-platform-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+      - GF_SERVER_ROOT_URL=http://localhost:3001
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # METABASE - Business Intelligence
+  # ---------------------------------------------------------------------------
+  metabase:
+    image: metabase/metabase:latest
+    container_name: data-platform-metabase
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: ${POSTGRES_USER}
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+      MB_DB_HOST: postgres
+      MB_ENCRYPTION_SECRET_KEY: metabase_secret_key_change_this
+    ports:
+      - "3000:3000"
+    volumes:
+      - metabase-data:/metabase-data
+    depends_on:
+      - postgres
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # PGADMIN - PostgreSQL Web Interface
+  # ---------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: data-platform-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_WTF_CSRF_CHECK_DEFAULT: 'False'
+      PGADMIN_CONFIG_WTF_CSRF_ENABLED: 'False'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # REDIS - Message Broker for Celery
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: data-platform-redis
+    expose:
+      - ${REDIS_PORT}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # MINIO - S3-Compatible Object Storage
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: data-platform-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # MINIO CLIENT - Create default buckets
+  # ---------------------------------------------------------------------------
+  minio-create-buckets:
+    image: minio/mc:latest
+    container_name: data-platform-minio-setup
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      /usr/bin/mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      /usr/bin/mc mb myminio/airflow-data --ignore-existing;
+      /usr/bin/mc mb myminio/spark-data --ignore-existing;
+      /usr/bin/mc mb myminio/datalake --ignore-existing;
+      /usr/bin/mc anonymous set download myminio/airflow-data;
+      /usr/bin/mc anonymous set download myminio/spark-data;
+      /usr/bin/mc anonymous set download myminio/datalake;
+      exit 0;
+      "
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # SPARK MASTER
+  # ---------------------------------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: data-platform-spark-master
+    user: root
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=${SPARK_MASTER_PORT}
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.master.Master"]
+    ports:
+      - "${SPARK_MASTER_PORT}:7077"
+      - "${SPARK_MASTER_WEBUI_PORT}:8080"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/spark-apps:/opt/spark-apps
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/spark-data
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # SPARK WORKER
+  # ---------------------------------------------------------------------------
+  spark-worker:
+    image: apache/spark:3.5.0
+    container_name: data-platform-spark-worker
+    user: root
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:${SPARK_MASTER_PORT}
+      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES}
+      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY}
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    ports:
+      - "${SPARK_WORKER_WEBUI_PORT}:8081"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/spark-apps:/opt/spark-apps
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/spark-data
+    depends_on:
+      - spark-master
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # JUPYTER NOTEBOOK with PySpark
+  # ---------------------------------------------------------------------------
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: data-platform-jupyter
+    environment:
+      - JUPYTER_ENABLE_LAB=${JUPYTER_ENABLE_LAB}
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+      - SPARK_MASTER=spark://spark-master:${SPARK_MASTER_PORT}
+      - PYSPARK_SUBMIT_ARGS=--master spark://spark-master:${SPARK_MASTER_PORT} pyspark-shell
+    ports:
+      - "${JUPYTER_PORT}:8888"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/notebooks:/home/jovyan/work
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/home/jovyan/data
+      - ${AIRFLOW_PROJ_DIR:-.}/spark-apps:/home/jovyan/spark-apps
+    restart: always
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # AIRFLOW WEBSERVER (Mantido - Porta 8080)
+  # ---------------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: data-platform-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # AIRFLOW SCHEDULER (Mantido)
+  # ---------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: data-platform-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # AIRFLOW WORKER (Mantido)
+  # ---------------------------------------------------------------------------
+  airflow-worker:
+    <<: *airflow-common
+    container_name: data-platform-airflow-worker
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # AIRFLOW TRIGGERER (Mantido)
+  # ---------------------------------------------------------------------------
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: data-platform-airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # AIRFLOW INIT (Mantido)
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: data-platform-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        function ver() {
+          printf "%04d%04d%04d%04d" $${1//./ }
+        }
+        airflow_version=$$(AIRFLOW__LOGGING__LOGGING_LEVEL=INFO && gosu airflow airflow version)
+        airflow_version_comparable=$$(ver $${airflow_version})
+        min_airflow_version=2.2.0
+        min_airflow_version_comparable=$$(ver $${min_airflow_version})
+        if (( airflow_version_comparable < min_airflow_version_comparable )); then
+          echo
+          echo -e "\033[1;31mERROR: Airflow version $${airflow_version} is too old!\e[0m"
+          echo "Minimum version required: $${min_airflow_version}"
+          echo
+          exit 1
+        fi
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING: AIRFLOW_UID not set!\e[0m"
+          echo
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        disk_available=$$(df / | tail -1 | awk '{print $$4}')
+        warning_resources="false"
+        if (( mem_available < 4000 )); then
+          echo
+          echo -e "\033[1;33mWARNING: Not enough memory available!\e[0m"
+          echo "At least 4GB required. You have $$(numfmt --to iec $$((mem_available * one_meg)))"
+          echo
+          warning_resources="true"
+        fi
+        if (( cpus_available < 2 )); then
+          echo
+          echo -e "\033[1;33mWARNING: Not enough CPUs available!\e[0m"
+          echo "At least 2 CPUs recommended. You have $${cpus_available}"
+          echo
+          warning_resources="true"
+        fi
+        if (( disk_available < one_meg * 10 )); then
+          echo
+          echo -e "\033[1;33mWARNING: Not enough disk space available!\e[0m"
+          echo "At least 10GB recommended. You have $$(numfmt --to iec $$((disk_available * 1024)))"
+          echo
+          warning_resources="true"
+        fi
+        if [[ $${warning_resources} == "true" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING: Insufficient resources detected!\e[0m"
+          echo
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/data /sources/notebooks /sources/spark-apps
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,data,notebooks,spark-apps}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+    networks:
+      - data-platform-network
+
+  # ---------------------------------------------------------------------------
+  # FLOWER - Celery Monitoring (Mantido - Porta 5555)
+  # ---------------------------------------------------------------------------
+  flower:
+    <<: *airflow-common
+    container_name: data-platform-flower
+    command: celery flower
+    profiles:
+      - flower
+    ports:
+      - "${FLOWER_PORT}:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data-platform-network
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  postgres-db-volume:
+    driver: local
+  minio-data:
+    driver: local
+  pgadmin-data:
+    driver: local
+  metabase-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  mlflow-data:
+    driver: local
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  data-platform-network:
+    driver: bridge
+    name: data-platform-network
