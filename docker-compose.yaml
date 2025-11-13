@@ -1,7 +1,7 @@
 # =============================================================================
 # DATA PLATFORM - Airflow + Spark + MinIO + Jupyter + PostgreSQL + PgAdmin + Metabase
 # =============================================================================
-# VersÃ£o: 2.0
+# Versão: 2.0
 # Stack: Airflow 2.8.1 | Spark 3.5.0 | MinIO | Jupyter | PostgreSQL 15 | Metabase
 # =============================================================================
 
@@ -273,10 +273,16 @@ services:
       /usr/bin/mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
       /usr/bin/mc mb myminio/airflow-data --ignore-existing;
       /usr/bin/mc mb myminio/spark-data --ignore-existing;
-      /usr/bin/mc mb myminio/datalake --ignore-existing;
+      /usr/bin/mc mb myminio/landing --ignore-existing;
+      /usr/bin/mc mb myminio/bronze --ignore-existing;
+      /usr/bin/mc mb myminio/silver --ignore-existing;
+      /usr/bin/mc mb myminio/gold --ignore-existing;
       /usr/bin/mc anonymous set download myminio/airflow-data;
       /usr/bin/mc anonymous set download myminio/spark-data;
-      /usr/bin/mc anonymous set download myminio/datalake;
+      /usr/bin/mc anonymous set download myminio/landing;
+      /usr/bin/mc anonymous set download myminio/bronze;
+      /usr/bin/mc anonymous set download myminio/silver;
+      /usr/bin/mc anonymous set download myminio/gold;
       exit 0;
       "
     networks:
@@ -331,22 +337,14 @@ services:
       - data-platform-network
 
   # ---------------------------------------------------------------------------
-  # JUPYTER NOTEBOOK with PySpark
+  # JUPYTER NOTEBOOK with PySpark - CONFIGURAÇÃO SIMPLES
   # ---------------------------------------------------------------------------
   jupyter:
     image: jupyter/pyspark-notebook:latest
     container_name: data-platform-jupyter
-    user: root
-    entrypoint: ["/bin/bash", "-c"]
-    command: 
-      - |
-        chown -R jovyan:users /home/jovyan/work /home/jovyan/data /home/jovyan/spark-apps
-        exec su jovyan -c "start-notebook.sh --NotebookApp.token=jupyter123"
     environment:
-      - JUPYTER_ENABLE_LAB=yes
-      - SPARK_MASTER=spark://spark-master:7077
-      - PYSPARK_SUBMIT_ARGS=--master spark://spark-master:7077 pyspark-shell
-      - GRANT_SUDO=yes
+      JUPYTER_ENABLE_LAB: "yes"
+      JUPYTER_TOKEN: "jupyter123"
     ports:
       - "8888:8888"
     volumes:
@@ -505,7 +503,8 @@ services:
           echo -e "\033[1;33mWARNING: Insufficient resources detected!\e[0m"
           echo
         fi
-        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/data /sources/notebooks /sources/spark-apps
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/data /sources/notebooks /sources/spark-apps /sources/notebooks/output
+        chmod -R 777 /sources/logs /sources/dags /sources/plugins /sources/data /sources/notebooks /sources/spark-apps
         chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,data,notebooks,spark-apps}
         exec /entrypoint airflow version
     environment:
